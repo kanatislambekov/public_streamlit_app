@@ -173,7 +173,7 @@ def generate_profile_combinations(
         )
 
     return [
-        dict(zip(PROFILE_COLUMNS, values, strict=True))
+        dict(zip(PROFILE_COLUMNS, values))
         for values in product(*(normalized_selections[column] for column in PROFILE_COLUMNS))
     ]
 
