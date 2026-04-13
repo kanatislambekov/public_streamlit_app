@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
-from itertools import product
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -45,31 +41,6 @@ PROFILE_COLUMNS = [
     "household_group",
     "settlement_type",
 ]
-
-PROFILE_VALUE_ORDERS = {
-    "survey_year_factor": YEAR_ORDER,
-    "age_group4": AGE4_ORDER,
-    "sex_factor": SEX_ORDER,
-    "region_harmonized": HARMONIZED_REGION_ORDER,
-    "edu_group": EDU_ORDER,
-    "children_u18_label": CHILD_ORDER,
-    "household_group": HOUSEHOLD_GROUP_ORDER,
-    "settlement_type": SETTLEMENT_ORDER,
-}
-
-PROFILE_FIELD_LABELS = {
-    "survey_year_factor": "Survey year",
-    "age_group4": "Age group",
-    "sex_factor": "Sex",
-    "region_harmonized": "Region",
-    "edu_group": "Education",
-    "children_u18_label": "Child in household",
-    "household_group": "Household size",
-    "settlement_type": "Settlement type",
-}
-
-MAX_PROFILE_COMBINATIONS = 128
-VALIDATION_TOLERANCE = 1e-6
 
 MLOGIT_SPECS = ARTIFACTS["multinomial"]
 
@@ -117,86 +88,7 @@ def default_profile() -> dict[str, str]:
     }
 
 
-def _preview_values(values: Sequence[str], limit: int = 5) -> str:
-    preview = ", ".join(values[:limit])
-    if len(values) > limit:
-        return f"{preview}, ..."
-    return preview
-
-
-def validate_profile(profile: Mapping[str, str]) -> None:
-    missing_columns = [PROFILE_FIELD_LABELS[col] for col in PROFILE_COLUMNS if col not in profile]
-    extra_columns = sorted(set(profile) - set(PROFILE_COLUMNS))
-    issues = []
-
-    if missing_columns:
-        issues.append(f"Missing profile inputs: {', '.join(missing_columns)}.")
-    if extra_columns:
-        issues.append(f"Unexpected profile inputs: {', '.join(extra_columns)}.")
-
-    for column in PROFILE_COLUMNS:
-        if column not in profile:
-            continue
-        value = profile[column]
-        if value not in PROFILE_VALUE_ORDERS[column]:
-            issues.append(f"{PROFILE_FIELD_LABELS[column]} must be one of {', '.join(PROFILE_VALUE_ORDERS[column])}.")
-
-    if issues:
-        raise ValueError(" ".join(issues))
-
-
-def generate_profile_combinations(
-    selections: Mapping[str, Sequence[str]],
-    max_profiles: int = MAX_PROFILE_COMBINATIONS,
-) -> list[dict[str, str]]:
-    normalized_selections: dict[str, list[str]] = {}
-    combination_count = 1
-
-    for column in PROFILE_COLUMNS:
-        selected_values = list(dict.fromkeys(selections.get(column, [])))
-        if not selected_values:
-            raise ValueError(f"Select at least one value for {PROFILE_FIELD_LABELS[column]}.")
-
-        invalid_values = [value for value in selected_values if value not in PROFILE_VALUE_ORDERS[column]]
-        if invalid_values:
-            raise ValueError(
-                f"{PROFILE_FIELD_LABELS[column]} contains invalid selections: {_preview_values(invalid_values)}."
-            )
-
-        ordered_values = [value for value in PROFILE_VALUE_ORDERS[column] if value in set(selected_values)]
-        normalized_selections[column] = ordered_values
-        combination_count *= len(ordered_values)
-
-    if combination_count > max_profiles:
-        raise ValueError(
-            f"Current selections create {combination_count} profile combinations. "
-            f"Please narrow the filters to {max_profiles} combinations or fewer."
-        )
-
-    return [
-        dict(zip(PROFILE_COLUMNS, values))
-        for values in product(*(normalized_selections[column] for column in PROFILE_COLUMNS))
-    ]
-
-
-def profile_label(profile: Mapping[str, str]) -> str:
-    validate_profile(profile)
-    return " | ".join(
-        [
-            profile["survey_year_factor"],
-            profile["age_group4"],
-            profile["sex_factor"],
-            profile["region_harmonized"],
-            display_label(profile["edu_group"]),
-            display_label(profile["children_u18_label"]),
-            profile["household_group"],
-            profile["settlement_type"],
-        ]
-    )
-
-
 def make_profile_frame(profile: dict[str, str]) -> pd.DataFrame:
-    validate_profile(profile)
     return pd.DataFrame([{col: profile[col] for col in PROFILE_COLUMNS}])
 
 
@@ -256,28 +148,6 @@ def build_design_matrix(df: pd.DataFrame, include_age_education_interactions: bo
     return out
 
 
-@lru_cache(maxsize=1)
-def _profile_universe() -> pd.DataFrame:
-    return pd.DataFrame(
-        product(
-            YEAR_ORDER,
-            AGE4_ORDER,
-            SEX_ORDER,
-            HARMONIZED_REGION_ORDER,
-            EDU_ORDER,
-            CHILD_ORDER,
-            HOUSEHOLD_GROUP_ORDER,
-            SETTLEMENT_ORDER,
-        ),
-        columns=PROFILE_COLUMNS,
-    )
-
-
-@lru_cache(maxsize=2)
-def _available_design_columns(include_age_education_interactions: bool) -> tuple[str, ...]:
-    return tuple(build_design_matrix(_profile_universe(), include_age_education_interactions).columns)
-
-
 def get_binary_artifact() -> BinaryArtifact:
     artifact = ARTIFACTS["binary_age_education"]
     return BinaryArtifact(
@@ -299,63 +169,6 @@ def get_multinomial_artifact(model_key: str) -> MultinomialArtifact:
         beta_matrix=np.asarray(artifact["beta_matrix"], dtype=float),
         cov_matrix=np.asarray(artifact["cov_matrix"], dtype=float),
     )
-
-
-@lru_cache(maxsize=1)
-def validate_artifacts() -> tuple[str, ...]:
-    issues: list[str] = []
-
-    binary_artifact = get_binary_artifact()
-    binary_columns = len(binary_artifact.design_columns)
-    available_binary_columns = set(_available_design_columns(include_age_education_interactions=True))
-
-    if len(binary_artifact.params) != binary_columns:
-        issues.append(
-            "Binary model parameter count does not match the design matrix columns "
-            f"({len(binary_artifact.params)} vs {binary_columns})."
-        )
-    if binary_artifact.cov_matrix.shape != (binary_columns, binary_columns):
-        issues.append(
-            "Binary model covariance matrix shape does not match the design matrix "
-            f"({binary_artifact.cov_matrix.shape} vs {(binary_columns, binary_columns)})."
-        )
-
-    missing_binary_columns = sorted(set(binary_artifact.design_columns) - available_binary_columns)
-    if missing_binary_columns:
-        issues.append(
-            "Binary model design columns are not generated by the app design matrix: "
-            f"{_preview_values(missing_binary_columns)}."
-        )
-
-    available_multinomial_columns = set(_available_design_columns(include_age_education_interactions=False))
-    for model_key in MLOGIT_SPECS:
-        artifact = get_multinomial_artifact(model_key)
-        design_columns = len(artifact.design_columns)
-        n_nonbase = len(artifact.categories) - 1
-        expected_beta_shape = (n_nonbase, design_columns)
-        expected_cov_shape = (n_nonbase * design_columns, n_nonbase * design_columns)
-
-        if len(set(artifact.categories)) != len(artifact.categories):
-            issues.append(f"{model_key}: categories contain duplicates.")
-        if artifact.categories[0] != artifact.baseline:
-            issues.append(f"{model_key}: the baseline category is not first in the category list.")
-        if artifact.beta_matrix.shape != expected_beta_shape:
-            issues.append(
-                f"{model_key}: beta matrix shape {artifact.beta_matrix.shape} does not match {expected_beta_shape}."
-            )
-        if artifact.cov_matrix.shape != expected_cov_shape:
-            issues.append(
-                f"{model_key}: covariance matrix shape {artifact.cov_matrix.shape} does not match {expected_cov_shape}."
-            )
-
-        missing_design_columns = sorted(set(artifact.design_columns) - available_multinomial_columns)
-        if missing_design_columns:
-            issues.append(
-                f"{model_key}: design columns are not generated by the app design matrix: "
-                f"{_preview_values(missing_design_columns)}."
-            )
-
-    return tuple(issues)
 
 
 def aligned_binary_design(profile_df: pd.DataFrame) -> pd.DataFrame:
@@ -396,23 +209,6 @@ def predict_profile(profile: dict[str, str]) -> dict[str, float]:
     profile_df = make_profile_frame(profile)
     exog = aligned_binary_design(profile_df)
     return probability_from_design_row(exog.iloc[0])
-
-
-def profile_predictions_table(profiles: Sequence[Mapping[str, str]]) -> pd.DataFrame:
-    rows = []
-    for profile in profiles:
-        validated_profile = {column: profile[column] for column in PROFILE_COLUMNS}
-        prediction = predict_profile(validated_profile)
-        rows.append(
-            {
-                "profile_label": profile_label(validated_profile),
-                **validated_profile,
-                "probability_pct": prediction["probability_pct"],
-                "ci_lower_pct": prediction["ci_lower_pct"],
-                "ci_upper_pct": prediction["ci_upper_pct"],
-            }
-        )
-    return pd.DataFrame(rows)
 
 
 def probability_difference(left_profile: dict[str, str], right_profile: dict[str, str]) -> dict[str, float]:
@@ -517,162 +313,6 @@ def interaction_wald_test() -> dict[str, float]:
 
 def multinomial_specs() -> dict[str, dict[str, object]]:
     return MLOGIT_SPECS
-
-
-def _validate_interval(
-    estimate: float,
-    lower: float,
-    upper: float,
-    label: str,
-    lower_bound: float,
-    upper_bound: float,
-    tolerance: float = VALIDATION_TOLERANCE,
-) -> list[str]:
-    if not all(np.isfinite(value) for value in (estimate, lower, upper)):
-        return [f"{label}: encountered a non-finite value in the estimate or confidence interval."]
-
-    issues = []
-    if estimate < lower_bound - tolerance or estimate > upper_bound + tolerance:
-        issues.append(f"{label}: estimate {estimate:.6f} falls outside [{lower_bound:.1f}, {upper_bound:.1f}].")
-    if lower < lower_bound - tolerance or lower > upper_bound + tolerance:
-        issues.append(f"{label}: lower bound {lower:.6f} falls outside [{lower_bound:.1f}, {upper_bound:.1f}].")
-    if upper < lower_bound - tolerance or upper > upper_bound + tolerance:
-        issues.append(f"{label}: upper bound {upper:.6f} falls outside [{lower_bound:.1f}, {upper_bound:.1f}].")
-    if lower > estimate + tolerance or estimate > upper + tolerance:
-        issues.append(f"{label}: interval ordering is invalid ({lower:.6f}, {estimate:.6f}, {upper:.6f}).")
-    return issues
-
-
-def validate_binary_prediction(prediction: Mapping[str, float], label: str = "Selected profile") -> list[str]:
-    required_keys = {"probability", "probability_pct", "ci_lower_pct", "ci_upper_pct"}
-    missing_keys = sorted(required_keys - set(prediction))
-    if missing_keys:
-        return [f"{label}: prediction output is missing keys: {', '.join(missing_keys)}."]
-
-    issues = _validate_interval(
-        float(prediction["probability_pct"]),
-        float(prediction["ci_lower_pct"]),
-        float(prediction["ci_upper_pct"]),
-        label,
-        lower_bound=0.0,
-        upper_bound=100.0,
-    )
-
-    probability = float(prediction["probability"])
-    if not np.isfinite(probability) or probability < -VALIDATION_TOLERANCE or probability > 1.0 + VALIDATION_TOLERANCE:
-        issues.append(f"{label}: raw probability {probability:.6f} falls outside [0, 1].")
-    if abs((100.0 * probability) - float(prediction["probability_pct"])) > VALIDATION_TOLERANCE:
-        issues.append(f"{label}: raw and percent probabilities are inconsistent.")
-    return issues
-
-
-def validate_probability_frame(
-    df: pd.DataFrame,
-    probability_col: str,
-    ci_lower_col: str,
-    ci_upper_col: str,
-    label: str,
-    row_label_col: Optional[str] = None,
-    lower_bound: float = 0.0,
-    upper_bound: float = 100.0,
-    tolerance: float = VALIDATION_TOLERANCE,
-) -> list[str]:
-    required_columns = [probability_col, ci_lower_col, ci_upper_col]
-    missing_columns = [column for column in required_columns if column not in df.columns]
-    if missing_columns:
-        return [f"{label}: missing required columns {', '.join(missing_columns)}."]
-    if df.empty:
-        return [f"{label}: no rows were produced."]
-
-    issues = []
-    for row_number, (_, row) in enumerate(df.iterrows(), start=1):
-        row_label = str(row[row_label_col]) if row_label_col and row_label_col in df.columns else f"row {row_number}"
-        issues.extend(
-            _validate_interval(
-                float(row[probability_col]),
-                float(row[ci_lower_col]),
-                float(row[ci_upper_col]),
-                f"{label} ({row_label})",
-                lower_bound=lower_bound,
-                upper_bound=upper_bound,
-                tolerance=tolerance,
-            )
-        )
-    return issues
-
-
-def validate_difference_frame(
-    df: pd.DataFrame,
-    predicted_col: str,
-    reference_col: str,
-    difference_col: str,
-    ci_lower_col: str,
-    ci_upper_col: str,
-    label: str,
-    row_label_col: Optional[str] = None,
-    tolerance: float = VALIDATION_TOLERANCE,
-) -> list[str]:
-    required_columns = [predicted_col, reference_col, difference_col, ci_lower_col, ci_upper_col]
-    missing_columns = [column for column in required_columns if column not in df.columns]
-    if missing_columns:
-        return [f"{label}: missing required columns {', '.join(missing_columns)}."]
-    if df.empty:
-        return [f"{label}: no rows were produced."]
-
-    issues = []
-    for row_number, (_, row) in enumerate(df.iterrows(), start=1):
-        row_label = str(row[row_label_col]) if row_label_col and row_label_col in df.columns else f"row {row_number}"
-        issues.extend(
-            _validate_interval(
-                float(row[difference_col]),
-                float(row[ci_lower_col]),
-                float(row[ci_upper_col]),
-                f"{label} ({row_label})",
-                lower_bound=-100.0,
-                upper_bound=100.0,
-                tolerance=tolerance,
-            )
-        )
-
-        computed_difference = float(row[predicted_col]) - float(row[reference_col])
-        if not np.isfinite(computed_difference):
-            issues.append(f"{label} ({row_label}): predicted and reference values are not finite.")
-        elif abs(computed_difference - float(row[difference_col])) > tolerance:
-            issues.append(
-                f"{label} ({row_label}): reported difference {float(row[difference_col]):.6f} "
-                f"does not match predicted-reference gap {computed_difference:.6f}."
-            )
-    return issues
-
-
-def validate_multinomial_probability_frame(
-    df: pd.DataFrame,
-    label: str,
-    probability_col: str = "predicted_probability_pct",
-    ci_lower_col: str = "ci_lower_pct",
-    ci_upper_col: str = "ci_upper_pct",
-    row_label_col: str = "category",
-    tolerance: float = VALIDATION_TOLERANCE,
-) -> list[str]:
-    issues = validate_probability_frame(
-        df,
-        probability_col=probability_col,
-        ci_lower_col=ci_lower_col,
-        ci_upper_col=ci_upper_col,
-        label=label,
-        row_label_col=row_label_col,
-        lower_bound=0.0,
-        upper_bound=100.0,
-        tolerance=tolerance,
-    )
-
-    if probability_col not in df.columns:
-        return issues
-
-    total_probability = float(df[probability_col].sum())
-    if not np.isfinite(total_probability) or abs(total_probability - 100.0) > tolerance:
-        issues.append(f"{label}: predicted probabilities sum to {total_probability:.10f}% instead of 100%.")
-    return issues
 
 
 def multinomial_probabilities(model_key: str, profile: dict[str, str]) -> pd.DataFrame:
