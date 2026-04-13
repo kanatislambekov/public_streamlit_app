@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import product
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -571,7 +572,7 @@ def validate_probability_frame(
     ci_lower_col: str,
     ci_upper_col: str,
     label: str,
-    row_label_col: str | None = None,
+    row_label_col: Optional[str] = None,
     lower_bound: float = 0.0,
     upper_bound: float = 100.0,
     tolerance: float = VALIDATION_TOLERANCE,
@@ -608,7 +609,7 @@ def validate_difference_frame(
     ci_lower_col: str,
     ci_upper_col: str,
     label: str,
-    row_label_col: str | None = None,
+    row_label_col: Optional[str] = None,
     tolerance: float = VALIDATION_TOLERANCE,
 ) -> list[str]:
     required_columns = [predicted_col, reference_col, difference_col, ci_lower_col, ci_upper_col]
