@@ -5,11 +5,13 @@ import pandas as pd
 import streamlit as st
 
 from app_utils import (
+    ALL_OPTION,
     AGE4_ORDER,
     CHILD_ORDER,
     EDU_ORDER,
     HARMONIZED_REGION_ORDER,
     HOUSEHOLD_GROUP_ORDER,
+    PROFILE_OPTION_ORDERS,
     SETTLEMENT_ORDER,
     SEX_ORDER,
     YEAR_ORDER,
@@ -21,7 +23,9 @@ from app_utils import (
     interaction_wald_test,
     multinomial_probabilities,
     multinomial_specs,
+    normalize_selection,
     predict_profile,
+    selection_description,
 )
 
 
@@ -39,6 +43,28 @@ def horizontal_axis(title: str, label_limit: int = 220) -> alt.Axis:
     return alt.Axis(title=title, labelAngle=0, labelLimit=label_limit)
 
 
+def selection_table_row(label: str, values: list[str], format_func=lambda value: value) -> dict[str, str]:
+    rendered = [format_func(value) for value in values]
+    display = ", ".join(rendered) if len(rendered) <= 3 else f"{', '.join(rendered[:3])}, ..."
+    return {"Parameter": label, "Selected values": display, "Count": str(len(values))}
+
+
+def selection_widget(
+    label: str,
+    column: str,
+    default_value: str,
+    format_func=lambda value: value,
+) -> list[str]:
+    options = PROFILE_OPTION_ORDERS[column]
+    raw_selection = st.multiselect(
+        label,
+        options=[ALL_OPTION, *options],
+        default=[default_value],
+        format_func=lambda value: ALL_OPTION if value == ALL_OPTION else format_func(value),
+    )
+    return normalize_selection(raw_selection, options)
+
+
 def main() -> None:
     st.title("Smoking Probability Dashboard")
     st.caption(
@@ -51,57 +77,62 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Profile Inputs")
-        survey_year = st.selectbox("Survey year", YEAR_ORDER, index=YEAR_ORDER.index(defaults["survey_year_factor"]))
-        age_group = st.selectbox("Age group", AGE4_ORDER, index=AGE4_ORDER.index(defaults["age_group4"]))
-        sex = st.selectbox("Sex", SEX_ORDER, index=SEX_ORDER.index(defaults["sex_factor"]))
-        region = st.selectbox(
+        survey_years = selection_widget("Survey year", "survey_year_factor", defaults["survey_year_factor"])
+        age_groups = selection_widget("Age group", "age_group4", defaults["age_group4"])
+        sexes = selection_widget("Sex", "sex_factor", defaults["sex_factor"])
+        regions = selection_widget(
             "Region",
-            HARMONIZED_REGION_ORDER,
-            index=HARMONIZED_REGION_ORDER.index(defaults["region_harmonized"]),
+            "region_harmonized",
+            defaults["region_harmonized"],
         )
-        education = st.selectbox(
+        educations = selection_widget(
             "Education",
-            EDU_ORDER,
-            index=EDU_ORDER.index(defaults["edu_group"]),
+            "edu_group",
+            defaults["edu_group"],
             format_func=display_label,
         )
-        child_status = st.selectbox(
+        child_statuses = selection_widget(
             "Child in household",
-            CHILD_ORDER,
-            index=CHILD_ORDER.index(defaults["children_u18_label"]),
+            "children_u18_label",
+            defaults["children_u18_label"],
             format_func=display_label,
         )
-        household_group = st.selectbox(
+        household_groups = selection_widget(
             "Household size",
-            HOUSEHOLD_GROUP_ORDER,
-            index=HOUSEHOLD_GROUP_ORDER.index(defaults["household_group"]),
+            "household_group",
+            defaults["household_group"],
         )
-        settlement = st.selectbox(
+        settlements = selection_widget(
             "Settlement type",
-            SETTLEMENT_ORDER,
-            index=SETTLEMENT_ORDER.index(defaults["settlement_type"]),
+            "settlement_type",
+            defaults["settlement_type"],
         )
 
     profile = {
-        "survey_year_factor": survey_year,
-        "age_group4": age_group,
-        "sex_factor": sex,
-        "region_harmonized": region,
-        "edu_group": education,
-        "children_u18_label": child_status,
-        "household_group": household_group,
-        "settlement_type": settlement,
+        "survey_year_factor": survey_years,
+        "age_group4": age_groups,
+        "sex_factor": sexes,
+        "region_harmonized": regions,
+        "edu_group": educations,
+        "children_u18_label": child_statuses,
+        "household_group": household_groups,
+        "settlement_type": settlements,
     }
 
     profile_prediction = predict_profile(profile)
     grid = interaction_probability_grid(profile)
     education_effects = education_marginal_effects(profile)
     age_effects = age_marginal_effects(profile)
-    focused_education_effects = education_effects.loc[education_effects["age_group4"] == age_group].copy()
+    focused_education_effects = education_effects.loc[education_effects["age_group4"].isin(age_groups)].copy()
     focused_education_effects["education_display"] = focused_education_effects["education_level"].map(display_label)
-    focused_age_effects = age_effects.loc[age_effects["edu_group"] == education].copy()
+    focused_age_effects = age_effects.loc[age_effects["edu_group"].isin(educations)].copy()
+    focused_age_effects["education_display"] = focused_age_effects["edu_group"].map(display_label)
 
     st.subheader("Selected Profile")
+    st.caption(
+        "When you choose multiple values or `All`, the dashboard reports equal-weight averages across the "
+        "corresponding model-based profile combinations. No direct survey records are shown or shared."
+    )
     metric_col, ci_col, test_col = st.columns(3)
     metric_col.metric("Predicted probability of current smoking", f"{profile_prediction['probability_pct']:.1f}%")
     ci_col.metric(
@@ -111,10 +142,24 @@ def main() -> None:
     test_col.metric("Age x education joint test", f"p = {wald['p_value']:.3f}")
 
     st.write(
-        f"For a {age_group} respondent in {region}, with {display_label(education).lower()}, "
-        f"the model estimates a {profile_prediction['probability_pct']:.1f}% probability of current smoking "
-        f"after holding the other selected characteristics constant."
+        f"For profiles spanning {selection_description(age_groups)}, {selection_description(regions)}, and "
+        f"{selection_description(educations, display_label).lower()}, the model estimates a "
+        f"{profile_prediction['probability_pct']:.1f}% probability of current smoking after averaging across "
+        f"{profile_prediction['profiles_averaged']:,} selected profile combinations and holding the remaining "
+        f"selected characteristics constant."
     )
+
+    selection_rows = [
+        selection_table_row("Survey year", survey_years),
+        selection_table_row("Age group", age_groups),
+        selection_table_row("Sex", sexes),
+        selection_table_row("Region", regions),
+        selection_table_row("Education", educations, display_label),
+        selection_table_row("Child in household", child_statuses, display_label),
+        selection_table_row("Household size", household_groups),
+        selection_table_row("Settlement type", settlements),
+    ]
+    st.dataframe(pd.DataFrame(selection_rows), use_container_width=True, hide_index=True)
 
     st.subheader("Adjusted Probability Grid: Age x Education")
     grid_chart = grid.copy()
@@ -183,8 +228,12 @@ def main() -> None:
     edu_col, age_col = st.columns(2)
 
     with edu_col:
-        st.markdown(f"**Education effects within age {age_group}**")
-        edu_chart = (
+        if len(age_groups) == 1:
+            st.markdown(f"**Education effects within age {age_groups[0]}**")
+        else:
+            st.markdown("**Education effects within selected age groups**")
+
+        edu_chart_base = (
             alt.Chart(focused_education_effects)
             .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
             .encode(
@@ -203,8 +252,13 @@ def main() -> None:
                     alt.Tooltip("ci_upper_pct_points:Q", title="95% CI upper", format=".1f"),
                 ],
             )
-            .properties(height=260)
         )
+        if len(age_groups) == 1:
+            edu_chart = edu_chart_base.properties(height=260)
+        else:
+            edu_chart = edu_chart_base.encode(
+                column=alt.Column("age_group4:N", title="Age group", sort=age_groups),
+            ).properties(height=260)
         st.altair_chart(edu_chart, use_container_width=True)
 
         edu_table = focused_education_effects.copy()
@@ -229,8 +283,12 @@ def main() -> None:
         )
 
     with age_col:
-        st.markdown(f"**Age effects within {display_label(education)}**")
-        age_chart = (
+        if len(educations) == 1:
+            st.markdown(f"**Age effects within {display_label(educations[0])}**")
+        else:
+            st.markdown("**Age effects within selected education levels**")
+
+        age_chart_base = (
             alt.Chart(focused_age_effects)
             .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
             .encode(
@@ -244,8 +302,13 @@ def main() -> None:
                     alt.Tooltip("ci_upper_pct_points:Q", title="95% CI upper", format=".1f"),
                 ],
             )
-            .properties(height=260)
         )
+        if len(educations) == 1:
+            age_chart = age_chart_base.properties(height=260)
+        else:
+            age_chart = age_chart_base.encode(
+                column=alt.Column("education_display:N", title="Education", sort=[display_label(level) for level in educations]),
+            ).properties(height=260)
         st.altair_chart(age_chart, use_container_width=True)
 
         st.dataframe(
@@ -253,6 +316,7 @@ def main() -> None:
                 focused_age_effects.rename(
                     columns={
                         "age_group4": "Age group",
+                        "education_display": "Education",
                         "comparison": "Comparison",
                         "predicted_probability_pct": "Predicted %",
                         "reference_probability_pct": f"{AGE4_ORDER[0]} reference %",

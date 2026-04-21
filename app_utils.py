@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import product
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,7 @@ SETTLEMENT_ORDER = ARTIFACTS["constants"]["SETTLEMENT_ORDER"]
 SEX_ORDER = ARTIFACTS["constants"]["SEX_ORDER"]
 HARMONIZED_REGION_ORDER = ARTIFACTS["constants"]["HARMONIZED_REGION_ORDER"]
 YEAR_ORDER = ARTIFACTS["constants"]["YEAR_ORDER"]
+ALL_OPTION = "All"
 
 AGE_REFERENCE = AGE4_ORDER[0]
 EDU_REFERENCE = "Higher+"
@@ -41,6 +43,17 @@ PROFILE_COLUMNS = [
     "household_group",
     "settlement_type",
 ]
+
+PROFILE_OPTION_ORDERS = {
+    "survey_year_factor": YEAR_ORDER,
+    "age_group4": AGE4_ORDER,
+    "sex_factor": SEX_ORDER,
+    "region_harmonized": HARMONIZED_REGION_ORDER,
+    "edu_group": EDU_ORDER,
+    "children_u18_label": CHILD_ORDER,
+    "household_group": HOUSEHOLD_GROUP_ORDER,
+    "settlement_type": SETTLEMENT_ORDER,
+}
 
 MLOGIT_SPECS = ARTIFACTS["multinomial"]
 
@@ -88,8 +101,45 @@ def default_profile() -> dict[str, str]:
     }
 
 
-def make_profile_frame(profile: dict[str, str]) -> pd.DataFrame:
-    return pd.DataFrame([{col: profile[col] for col in PROFILE_COLUMNS}])
+def _as_list(value: str | list[str] | tuple[str, ...]) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def normalize_selection(value: str | list[str] | tuple[str, ...], ordered_options: list[str]) -> list[str]:
+    selected = [item for item in _as_list(value) if item in ordered_options or item == ALL_OPTION]
+    if not selected or ALL_OPTION in selected:
+        return list(ordered_options)
+
+    seen: set[str] = set()
+    normalized = []
+    for item in ordered_options:
+        if item in selected and item not in seen:
+            normalized.append(item)
+            seen.add(item)
+    return normalized
+
+
+def normalize_profile(profile: dict[str, str | list[str] | tuple[str, ...]]) -> dict[str, list[str]]:
+    return {
+        column: normalize_selection(profile[column], PROFILE_OPTION_ORDERS[column])
+        for column in PROFILE_COLUMNS
+    }
+
+
+def selection_description(values: list[str], display_func=display_label) -> str:
+    if len(values) == 1:
+        return display_func(values[0])
+    if len(values) == 2:
+        return f"{display_func(values[0])} and {display_func(values[1])}"
+    return f"{display_func(values[0])}, {display_func(values[1])}, and {len(values) - 2} more"
+
+
+def make_profile_frame(profile: dict[str, str | list[str] | tuple[str, ...]]) -> pd.DataFrame:
+    normalized = normalize_profile(profile)
+    combinations = list(product(*(normalized[column] for column in PROFILE_COLUMNS)))
+    return pd.DataFrame(combinations, columns=PROFILE_COLUMNS)
 
 
 def add_dummies(out: pd.DataFrame, series: pd.Series, prefix: str, reference: str) -> None:
@@ -205,30 +255,53 @@ def probability_from_design_row(exog_row: pd.Series) -> dict[str, float]:
     }
 
 
-def predict_profile(profile: dict[str, str]) -> dict[str, float]:
+def binary_summary_from_design(exog: pd.DataFrame) -> dict[str, float]:
+    artifact = get_binary_artifact()
+    x = exog.to_numpy(dtype=float)
+    eta = np.clip(x @ artifact.params, -700, 700)
+    probabilities = expit(eta)
+    gradients = probabilities[:, None] * (1.0 - probabilities[:, None]) * x
+
+    mean_probability = float(probabilities.mean())
+    mean_gradient = gradients.mean(axis=0)
+    variance = float(mean_gradient @ artifact.cov_matrix @ mean_gradient)
+    se = float(np.sqrt(max(variance, 0.0)))
+    lower = max(0.0, mean_probability - 1.96 * se)
+    upper = min(1.0, mean_probability + 1.96 * se)
+    return {
+        "probability": mean_probability,
+        "probability_pct": 100.0 * mean_probability,
+        "ci_lower_pct": 100.0 * lower,
+        "ci_upper_pct": 100.0 * upper,
+        "profiles_averaged": int(len(exog)),
+    }
+
+
+def predict_profile(profile: dict[str, str | list[str] | tuple[str, ...]]) -> dict[str, float]:
     profile_df = make_profile_frame(profile)
     exog = aligned_binary_design(profile_df)
-    return probability_from_design_row(exog.iloc[0])
+    return binary_summary_from_design(exog)
 
 
-def probability_difference(left_profile: dict[str, str], right_profile: dict[str, str]) -> dict[str, float]:
+def probability_difference(
+    left_profile: dict[str, str | list[str] | tuple[str, ...]],
+    right_profile: dict[str, str | list[str] | tuple[str, ...]],
+) -> dict[str, float]:
     artifact = get_binary_artifact()
-    profiles = pd.DataFrame([left_profile, right_profile])
-    exog = aligned_binary_design(profiles)
-    x_left = exog.iloc[0].to_numpy(dtype=float)
-    x_right = exog.iloc[1].to_numpy(dtype=float)
+    left_exog = aligned_binary_design(make_profile_frame(left_profile))
+    right_exog = aligned_binary_design(make_profile_frame(right_profile))
 
-    eta_left = float(x_left @ artifact.params)
-    eta_right = float(x_right @ artifact.params)
-    prob_left = float(expit(np.clip(eta_left, -700, 700)))
-    prob_right = float(expit(np.clip(eta_right, -700, 700)))
+    x_left = left_exog.to_numpy(dtype=float)
+    x_right = right_exog.to_numpy(dtype=float)
+    prob_left = expit(np.clip(x_left @ artifact.params, -700, 700))
+    prob_right = expit(np.clip(x_right @ artifact.params, -700, 700))
 
-    grad_left = prob_left * (1.0 - prob_left) * x_left
-    grad_right = prob_right * (1.0 - prob_right) * x_right
+    grad_left = (prob_left[:, None] * (1.0 - prob_left[:, None]) * x_left).mean(axis=0)
+    grad_right = (prob_right[:, None] * (1.0 - prob_right[:, None]) * x_right).mean(axis=0)
     gradient = grad_left - grad_right
     variance = float(gradient @ artifact.cov_matrix @ gradient)
     se = float(np.sqrt(max(variance, 0.0)))
-    diff = prob_left - prob_right
+    diff = float(prob_left.mean() - prob_right.mean())
     return {
         "difference_pct_points": 100.0 * diff,
         "ci_lower_pct_points": 100.0 * (diff - 1.96 * se),
@@ -236,7 +309,7 @@ def probability_difference(left_profile: dict[str, str], right_profile: dict[str
     }
 
 
-def interaction_probability_grid(base_profile: dict[str, str]) -> pd.DataFrame:
+def interaction_probability_grid(base_profile: dict[str, str | list[str] | tuple[str, ...]]) -> pd.DataFrame:
     rows = []
     for age in AGE4_ORDER:
         for education in EDU_ORDER:
@@ -254,7 +327,7 @@ def interaction_probability_grid(base_profile: dict[str, str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def education_marginal_effects(base_profile: dict[str, str]) -> pd.DataFrame:
+def education_marginal_effects(base_profile: dict[str, str | list[str] | tuple[str, ...]]) -> pd.DataFrame:
     rows = []
     for age in AGE4_ORDER:
         reference_profile = {**base_profile, "age_group4": age, "edu_group": EDU_REFERENCE}
@@ -277,7 +350,7 @@ def education_marginal_effects(base_profile: dict[str, str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def age_marginal_effects(base_profile: dict[str, str]) -> pd.DataFrame:
+def age_marginal_effects(base_profile: dict[str, str | list[str] | tuple[str, ...]]) -> pd.DataFrame:
     rows = []
     for education in EDU_ORDER:
         reference_profile = {**base_profile, "age_group4": AGE_REFERENCE, "edu_group": education}
@@ -315,34 +388,41 @@ def multinomial_specs() -> dict[str, dict[str, object]]:
     return MLOGIT_SPECS
 
 
-def multinomial_probabilities(model_key: str, profile: dict[str, str]) -> pd.DataFrame:
+def multinomial_probabilities(
+    model_key: str,
+    profile: dict[str, str | list[str] | tuple[str, ...]],
+) -> pd.DataFrame:
     artifact = get_multinomial_artifact(model_key)
-    x = aligned_multinomial_design(make_profile_frame(profile), model_key).iloc[0].to_numpy(dtype=float)
-    eta = np.clip(artifact.beta_matrix @ x, -700, 700)
+    x = aligned_multinomial_design(make_profile_frame(profile), model_key).to_numpy(dtype=float)
+    n_rows = x.shape[0]
+    eta = np.clip(x @ artifact.beta_matrix.T, -700, 700)
     exp_eta = np.exp(eta)
-    denom = 1.0 + exp_eta.sum()
-    probs = np.concatenate([[1.0 / denom], exp_eta / denom])
+    denom = 1.0 + exp_eta.sum(axis=1, keepdims=True)
+    probs_nonbase = exp_eta / denom
+    probs = np.concatenate([1.0 / denom, probs_nonbase], axis=1)
 
     rows = []
     n_nonbase = len(artifact.categories) - 1
     p = len(artifact.design_columns)
     for j, category in enumerate(artifact.categories):
-        gradient = np.zeros(n_nonbase * p, dtype=float)
+        gradients = np.zeros((n_rows, n_nonbase * p), dtype=float)
         if j == 0:
             for l in range(n_nonbase):
-                gradient[l * p : (l + 1) * p] = -probs[0] * probs[l + 1] * x
+                gradients[:, l * p : (l + 1) * p] = -(probs[:, [0]] * probs[:, [l + 1]]) * x
         else:
             for l in range(n_nonbase):
-                multiplier = probs[j] * ((1.0 if l == (j - 1) else 0.0) - probs[l + 1])
-                gradient[l * p : (l + 1) * p] = multiplier * x
-        variance = float(gradient @ artifact.cov_matrix @ gradient)
+                multiplier = probs[:, [j]] * ((1.0 if l == (j - 1) else 0.0) - probs[:, [l + 1]])
+                gradients[:, l * p : (l + 1) * p] = multiplier * x
+        mean_gradient = gradients.mean(axis=0)
+        variance = float(mean_gradient @ artifact.cov_matrix @ mean_gradient)
         se = float(np.sqrt(max(variance, 0.0)))
-        lower = max(0.0, probs[j] - 1.96 * se)
-        upper = min(1.0, probs[j] + 1.96 * se)
+        mean_prob = float(probs[:, j].mean())
+        lower = max(0.0, mean_prob - 1.96 * se)
+        upper = min(1.0, mean_prob + 1.96 * se)
         rows.append(
             {
                 "category": category,
-                "predicted_probability_pct": 100.0 * float(probs[j]),
+                "predicted_probability_pct": 100.0 * mean_prob,
                 "ci_lower_pct": 100.0 * lower,
                 "ci_upper_pct": 100.0 * upper,
             }
